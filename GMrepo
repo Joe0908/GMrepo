@@ -3,13 +3,9 @@
 # GMRepo v2 Minimal Explorer (Separated Pages, Faster)
 # Pages:
 #   1) Home / Overview
-#   2) Pairwise Group Comparison
-#   3) Disease & Taxon Atlas
-#
-# Speedups:
-#   - cache loading
-#   - cache joins (abundance+taxonomy+samples)
-#   - keep downstream heavy computations cached
+#   2) Disease & Taxon Atlas
+#   3) Pairwise Group Comparison
+
 
 from __future__ import annotations
 
@@ -701,67 +697,83 @@ def page_disease_taxon_atlas(samples: pd.DataFrame, abund: pd.DataFrame, taxa: p
             figc.update_layout(xaxis_title="Taxon", yaxis_title="Abundance", xaxis={"categoryorder": "total ascending"})
             st.plotly_chart(figc, use_container_width=True)
 
-    st.divider()
-    st.subheader("B) For one taxon: enriched or depleted across diseases (vs Healthy)")
+        st.divider()
+    st.subheader("B) Single disease composition (detailed view)")
 
-    if not has_healthy:
-        st.warning("No Healthy group found. This section requires Healthy as reference.")
-        return
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    with c1:
+        dis2 = st.selectbox("Disease (or group) for detailed view", diseases if diseases else groups, key="dis_detail")
+    with c2:
+        top_n2 = st.slider("Top N", 10, 500, 100, 10, key="topn_detail")
+    with c3:
+        agg2 = st.selectbox("Aggregation", ["mean", "median"], index=0, key="agg_detail")
+    with c4:
+        drop_unknown2 = st.checkbox("Drop Unknown/unclassified", value=True, key="dropunk_detail")
 
-    left, right = st.columns(2)
-    with left:
-        min_prev_global = st.slider("Min prevalence (either group)", 0.0, 1.0, 0.1, 0.05)
-        min_n = st.slider("Min samples per group", 3, 30, 8, 1)
-    with right:
-        q_cut_global = st.slider("q cutoff", 0.0, 0.25, 0.05, 0.01)
-        fc_cut_global = st.slider("abs(log2fc) cutoff", 0.0, 2.0, 0.0, 0.1)
+    st.caption("This shows abundance and prevalence within the selected disease only. No cross-disease testing.")
 
-    if st.button("Build or refresh disease vs Healthy matrix"):
-        with st.spinner("Computing all diseases vs Healthy (cached for these settings)..."):
-            stats_long = taxon_enrichment_matrix_vs_healthy(
-                joined=joined_ranked,
-                group_col=group_col,
-                rank_level=rank_level,
-                healthy_label=healthy_label,
-                min_prevalence=float(min_prev_global),
-                min_n_per_group=int(min_n),
-                drop_unknown=True,
-            )
-        st.session_state["stats_long"] = stats_long
-        st.success(f"Built matrix with {len(stats_long):,} rows.")
-
-    stats_long = st.session_state.get("stats_long", None)
-    if stats_long is None:
-        st.info("Click the button above to build the matrix.")
-        return
-    if stats_long.empty:
-        st.info("Matrix is empty. Lower min_n or min_prevalence and rebuild.")
-        return
-
-    taxa_list = sorted(stats_long["taxon"].dropna().astype(str).unique().tolist())
-    tax = st.selectbox("Taxon", taxa_list)
-
-    enriched, depleted = taxon_enriched_depleted_summary(
-        stats_long=stats_long,
-        taxon=tax,
-        q_cut=float(q_cut_global),
-        fc_cut=float(fc_cut_global),
+    comp2 = disease_composition_table(
+        joined=joined_ranked,
+        group_col=group_col,
+        disease=dis2,
+        rank_level=rank_level,
+        top_n=int(top_n2),
+        agg=str(agg2),
+        drop_unknown=bool(drop_unknown2),
     )
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.write("Enriched diseases")
-        st.dataframe(enriched, use_container_width=True)
-    with c2:
-        st.write("Depleted diseases")
-        st.dataframe(depleted, use_container_width=True)
+    if comp2.empty:
+        st.warning("No data for this selection. Try different filters or rank level.")
+        return
 
-    with st.expander("Show all diseases for this taxon (including non-significant)"):
-        all_d = stats_long[stats_long["taxon"].astype(str) == str(tax)].copy()
-        all_d["q_value"] = pd.to_numeric(all_d["q_value"], errors="coerce")
-        all_d["log2fc"] = pd.to_numeric(all_d["log2fc"], errors="coerce")
-        all_d = all_d.sort_values(["q_value", "log2fc"], ascending=[True, False])
-        st.dataframe(all_d, use_container_width=True)
+    # Optional extra filtering within the disease
+    with st.expander("Extra filters (within this disease)", expanded=False):
+        min_prev = st.slider("Min prevalence", 0.0, 1.0, 0.0, 0.05, key="minprev_detail")
+        min_abund = st.number_input("Min abundance", min_value=0.0, value=0.0, step=0.0001, key="minabund_detail")
+        query = st.text_input("Search taxon name contains", value="", key="query_detail").strip().lower()
+
+    comp_view = comp2.copy()
+    comp_view["prevalence"] = pd.to_numeric(comp_view["prevalence"], errors="coerce")
+    comp_view["abundance"] = pd.to_numeric(comp_view["abundance"], errors="coerce")
+
+    if min_prev > 0:
+        comp_view = comp_view[comp_view["prevalence"] >= float(min_prev)]
+    if min_abund > 0:
+        comp_view = comp_view[comp_view["abundance"] >= float(min_abund)]
+    if query:
+        comp_view = comp_view[comp_view["taxon"].astype(str).str.lower().str.contains(query, na=False)]
+
+    st.caption(f"Rows shown: {len(comp_view):,} (from top {int(top_n2)} before filtering)")
+    st.dataframe(comp_view, use_container_width=True)
+
+    if not comp_view.empty:
+        figb = px.bar(
+            comp_view.sort_values("abundance").tail(50),  # keep plot readable
+            x="taxon",
+            y="abundance",
+            hover_data=["prevalence"],
+            title=f"{dis2}: abundance ({agg2}), showing up to 50 taxa",
+        )
+        figb.update_layout(xaxis_title="Taxon", yaxis_title="Abundance", xaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(figb, use_container_width=True)
+
+        figp = px.bar(
+            comp_view.sort_values("prevalence").tail(50),
+            x="taxon",
+            y="prevalence",
+            title=f"{dis2}: prevalence, showing up to 50 taxa",
+        )
+        figp.update_layout(xaxis_title="Taxon", yaxis_title="Prevalence", xaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(figp, use_container_width=True)
+
+    csv_bytes = comp_view.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download detailed composition CSV",
+        data=csv_bytes,
+        file_name=f"{dis2}_composition_detailed.csv".replace(" ", "_"),
+        mime="text/csv",
+        key="dl_detail_comp",
+    )
 
 
 # ----------------------------
