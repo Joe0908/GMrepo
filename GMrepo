@@ -1,0 +1,825 @@
+# streamlit run /Users/yuqitao/Desktop/GMrepo_web.py
+#
+# GMRepo v2 Minimal Explorer (Separated Pages, Faster)
+# Pages:
+#   1) Home / Overview
+#   2) Pairwise Group Comparison
+#   3) Disease & Taxon Atlas
+#
+# Speedups:
+#   - cache loading
+#   - cache joins (abundance+taxonomy+samples)
+#   - keep downstream heavy computations cached
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+from scipy.stats import mannwhitneyu
+
+
+# ----------------------------
+# Configuration
+# ----------------------------
+
+@dataclass
+class DataPaths:
+    sample_metadata: str
+    abundance: str
+    taxonomy: str
+
+
+BASE_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "GMrepo")
+
+DATA_PATHS = DataPaths(
+    sample_metadata=os.path.join(BASE_DIR, "sample_metadata.tsv"),
+    abundance=os.path.join(BASE_DIR, "abundance.tsv"),
+    taxonomy=os.path.join(BASE_DIR, "taxonomy.tsv"),
+)
+
+APP_TITLE = "Gut Microbiome Interactive Explorer (GMRepo v2) - Minimal"
+
+
+# ----------------------------
+# IO + basic utilities
+# ----------------------------
+
+def _read_table(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".tsv", ".tab"]:
+        return pd.read_csv(path, sep="\t", dtype=str)
+    if ext in [".csv"]:
+        return pd.read_csv(path, dtype=str)
+
+    return pd.read_csv(path, sep=None, engine="python", dtype=str)
+
+
+def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    return df
+
+
+def _to_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def safe_unique_count(series: Optional[pd.Series]) -> int:
+    if series is None or len(series) == 0:
+        return 0
+    return int(series.dropna().nunique())
+
+
+def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
+    p = np.asarray(pvals, dtype=float)
+    n = p.size
+    order = np.argsort(p)
+    ranked = p[order]
+    adj = np.empty_like(ranked)
+
+    cummin = 1.0
+    for i in range(n - 1, -1, -1):
+        rank = i + 1
+        val = ranked[i] * n / rank
+        if val < cummin:
+            cummin = val
+        adj[i] = min(cummin, 1.0)
+
+    out = np.empty_like(adj)
+    out[order] = adj
+    return out
+
+
+# Cache raw loading (big win if files are large)
+@st.cache_data(show_spinner=False)
+def load_data(paths: DataPaths) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    samples = _standardize_columns(_read_table(paths.sample_metadata))
+    abund = _standardize_columns(_read_table(paths.abundance))
+    taxa = _standardize_columns(_read_table(paths.taxonomy))
+
+    abund = _to_numeric(abund, ["relative_abundance"])
+    samples = _to_numeric(samples, ["host_age", "bmi", "nr_reads_sequenced"])
+
+    return samples, abund, taxa
+
+
+# ----------------------------
+# Joins
+# ----------------------------
+
+@st.cache_data(show_spinner=False)
+def join_abundance_with_names(abund: pd.DataFrame, taxa: pd.DataFrame) -> pd.DataFrame:
+    a = abund.copy()
+    t = taxa.copy()
+
+    a["ncbi_taxon_id"] = a.get("ncbi_taxon_id", "").astype(str)
+    t["ncbi_taxon_id"] = t.get("ncbi_taxon_id", "").astype(str)
+
+    if "scientific_name" not in t.columns:
+        for alt in ["name", "taxon_name"]:
+            if alt in t.columns:
+                t = t.rename(columns={alt: "scientific_name"})
+                break
+
+    if "scientific_name" not in t.columns:
+        t["scientific_name"] = "Unknown"
+
+    merged = a.merge(
+        t[["ncbi_taxon_id", "scientific_name"]].drop_duplicates(),
+        on="ncbi_taxon_id",
+        how="left",
+    )
+    merged["scientific_name"] = merged["scientific_name"].fillna("Unknown")
+    return merged
+
+
+@st.cache_data(show_spinner=False)
+def join_abundance_with_samples(
+    abund_named: pd.DataFrame,
+    samples: pd.DataFrame,
+    abund_key: str = "accession_id",
+    sample_key: str = "run_id",
+) -> pd.DataFrame:
+    a = abund_named.copy()
+    s = samples.copy()
+
+    if abund_key not in a.columns:
+        raise ValueError(f"abundance table must contain '{abund_key}'")
+    if sample_key not in s.columns:
+        raise ValueError(f"sample metadata must contain '{sample_key}'")
+
+    a[abund_key] = a[abund_key].astype(str)
+    s[sample_key] = s[sample_key].astype(str)
+
+    merged = a.merge(
+        s,
+        left_on=abund_key,
+        right_on=sample_key,
+        how="left",
+        suffixes=("", "_sample"),
+    )
+    return merged
+
+
+def get_group_col(joined: pd.DataFrame) -> Optional[str]:
+    if "phenotype" in joined.columns:
+        return "phenotype"
+    if "disease" in joined.columns:
+        return "disease"
+    return None
+
+
+# BIG SPEEDUP: cache the full joined table
+@st.cache_data(show_spinner=False)
+def build_joined(samples: pd.DataFrame, abund: pd.DataFrame, taxa: pd.DataFrame) -> pd.DataFrame:
+    abund_named = join_abundance_with_names(abund, taxa)
+    joined = join_abundance_with_samples(abund_named, samples, abund_key="accession_id", sample_key="run_id")
+    return joined
+
+
+def filter_rank_level(joined: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str], Optional[str]]:
+    if "taxon_rank_level" in joined.columns and joined["taxon_rank_level"].notna().any():
+        rank_levels = sorted(joined["taxon_rank_level"].dropna().unique().tolist())
+        rank_level = st.selectbox("Taxon rank level", rank_levels, index=0)
+        return joined[joined["taxon_rank_level"].astype(str) == str(rank_level)].copy(), rank_level, None
+    return joined.copy(), None, "No taxon_rank_level found. Using all rows."
+
+
+def apply_optional_filters(joined: pd.DataFrame) -> pd.DataFrame:
+    with st.expander("Optional filters"):
+        if "experiment_type" in joined.columns and joined["experiment_type"].notna().any():
+            exp_types = ["All"] + sorted(joined["experiment_type"].dropna().unique().tolist())
+            exp_choice = st.selectbox("Experiment type", exp_types)
+            if exp_choice != "All":
+                joined = joined[joined["experiment_type"] == exp_choice]
+        else:
+            st.caption("No experiment_type column available (or all empty).")
+
+        if "country" in joined.columns and joined["country"].notna().any():
+            countries = ["All"] + sorted(joined["country"].dropna().unique().tolist())
+            country = st.selectbox("Country", countries)
+            if country != "All":
+                joined = joined[joined["country"] == country]
+        else:
+            st.caption("No country column available (or all empty).")
+
+        if "recent_antibiotics_use" in joined.columns and joined["recent_antibiotics_use"].notna().any():
+            abx = st.selectbox("Recent antibiotics use", ["All", "Y", "N"])
+            if abx != "All":
+                joined = joined[joined["recent_antibiotics_use"] == abx]
+        else:
+            st.caption("No recent_antibiotics_use column available (or all empty).")
+
+    return joined
+
+
+# ----------------------------
+# Stats: pairwise group comparison
+# ----------------------------
+
+@st.cache_data(show_spinner=False)
+def compute_group_comparison(
+    joined: pd.DataFrame,
+    group_col: str,
+    group_a: str,
+    group_b: str,
+    taxon_name_col: str = "scientific_name",
+    abundance_col: str = "relative_abundance",
+    min_prevalence: float = 0.1,
+) -> pd.DataFrame:
+    df = joined.copy()
+
+    for col in [group_col, taxon_name_col, abundance_col]:
+        if col not in df.columns:
+            raise ValueError(f"joined table missing required column: {col}")
+
+    df = df[df[group_col].astype(str).isin([str(group_a), str(group_b)])].copy()
+    df[abundance_col] = pd.to_numeric(df[abundance_col], errors="coerce")
+    df = df.dropna(subset=[abundance_col, taxon_name_col])
+
+    prevalence = (
+        df.assign(present=df[abundance_col] > 0)
+        .groupby([taxon_name_col, group_col])["present"]
+        .mean()
+        .unstack(group_col)
+        .fillna(0.0)
+    )
+    prevalence = prevalence.loc[:, ~prevalence.columns.duplicated()]
+
+    vec_a = prevalence[group_a] if group_a in prevalence.columns else pd.Series(0.0, index=prevalence.index)
+    vec_b = prevalence[group_b] if group_b in prevalence.columns else pd.Series(0.0, index=prevalence.index)
+
+    mask = (vec_a >= float(min_prevalence)) | (vec_b >= float(min_prevalence))
+    keep_taxa = prevalence.index[mask].tolist()
+    df = df[df[taxon_name_col].isin(keep_taxa)].copy()
+
+    rows = []
+    for taxon, sub in df.groupby(taxon_name_col, sort=False):
+        a = sub.loc[sub[group_col].astype(str) == str(group_a), abundance_col].to_numpy()
+        b = sub.loc[sub[group_col].astype(str) == str(group_b), abundance_col].to_numpy()
+
+        mean_a = float(np.nanmean(a)) if a.size else np.nan
+        mean_b = float(np.nanmean(b)) if b.size else np.nan
+
+        eps = 1e-6
+        log2fc = float(np.log2((mean_b + eps) / (mean_a + eps))) if np.isfinite(mean_a) and np.isfinite(mean_b) else np.nan
+
+        p = np.nan
+        if a.size > 1 and b.size > 1:
+            try:
+                p = float(mannwhitneyu(a, b, alternative="two-sided").pvalue)
+            except Exception:
+                p = np.nan
+
+        rows.append((str(taxon), mean_a, mean_b, log2fc, p, int(a.size), int(b.size)))
+
+    out = pd.DataFrame(
+        rows,
+        columns=[taxon_name_col, f"mean_{group_a}", f"mean_{group_b}", "log2fc", "pvalue", "n_a", "n_b"],
+    )
+
+    if out.empty:
+        out["qvalue"] = []
+        return out
+
+    out["qvalue"] = benjamini_hochberg(out["pvalue"].fillna(1.0).values)
+    out = out.sort_values(["qvalue", "pvalue"], ascending=[True, True], na_position="last").reset_index(drop=True)
+    return out
+
+
+# ----------------------------
+# Global summaries (Atlas)
+# ----------------------------
+
+@st.cache_data(show_spinner=False)
+def disease_composition_table(
+    joined: pd.DataFrame,
+    group_col: str,
+    disease: str,
+    rank_level: Optional[str] = None,
+    taxon_col: str = "scientific_name",
+    abundance_col: str = "relative_abundance",
+    top_n: int = 30,
+    agg: str = "mean",
+    drop_unknown: bool = True,
+) -> pd.DataFrame:
+    df = joined.copy()
+
+    for c in [group_col, taxon_col, abundance_col]:
+        if c not in df.columns:
+            raise ValueError(f"joined missing column: {c}")
+
+    if rank_level is not None and "taxon_rank_level" in df.columns:
+        df = df[df["taxon_rank_level"].astype(str) == str(rank_level)]
+
+    df[group_col] = df[group_col].astype(str)
+    df = df[df[group_col] == str(disease)].copy()
+
+    df[abundance_col] = pd.to_numeric(df[abundance_col], errors="coerce")
+    df = df.dropna(subset=[taxon_col, abundance_col])
+
+    if drop_unknown:
+        df = df[~df[taxon_col].astype(str).isin(["Unknown", "unclassified"])]
+
+    if df.empty:
+        return pd.DataFrame(columns=["taxon", "abundance", "prevalence", "n_samples"])
+
+    sample_col = "accession_id" if "accession_id" in df.columns else ("run_id" if "run_id" in df.columns else None)
+    if sample_col is None:
+        raise ValueError("no sample id column found (accession_id/run_id)")
+
+    pivot = df.pivot_table(index=sample_col, columns=taxon_col, values=abundance_col, fill_value=0.0)
+
+    abund = pivot.median(axis=0) if agg == "median" else pivot.mean(axis=0)
+    prev = (pivot > 0).mean(axis=0)
+    n_samples = int(pivot.shape[0])
+
+    out = pd.DataFrame(
+        {
+            "taxon": abund.index.astype(str),
+            "abundance": abund.values.astype(float),
+            "prevalence": prev.values.astype(float),
+            "n_samples": n_samples,
+        }
+    )
+    out = out.sort_values(["abundance", "prevalence"], ascending=[False, False]).head(int(top_n)).reset_index(drop=True)
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def taxon_enrichment_matrix_vs_healthy(
+    joined: pd.DataFrame,
+    group_col: str,
+    rank_level: Optional[str] = None,
+    healthy_label: str = "Healthy",
+    taxon_col: str = "scientific_name",
+    abundance_col: str = "relative_abundance",
+    min_prevalence: float = 0.1,
+    min_n_per_group: int = 8,
+    drop_unknown: bool = True,
+) -> pd.DataFrame:
+    df = joined.copy()
+
+    for c in [group_col, taxon_col, abundance_col]:
+        if c not in df.columns:
+            raise ValueError(f"joined missing column: {c}")
+
+    if rank_level is not None and "taxon_rank_level" in df.columns:
+        df = df[df["taxon_rank_level"].astype(str) == str(rank_level)]
+
+    df[group_col] = df[group_col].astype(str)
+    groups = sorted(df[group_col].dropna().unique().tolist())
+    if healthy_label not in groups:
+        raise ValueError(f"no '{healthy_label}' found in {group_col}")
+
+    diseases = [g for g in groups if g != healthy_label]
+    if not diseases:
+        return pd.DataFrame()
+
+    df[abundance_col] = pd.to_numeric(df[abundance_col], errors="coerce")
+    df = df.dropna(subset=[taxon_col, abundance_col])
+
+    if drop_unknown:
+        df = df[~df[taxon_col].astype(str).isin(["Unknown", "unclassified"])]
+
+    sample_col = "accession_id" if "accession_id" in df.columns else ("run_id" if "run_id" in df.columns else None)
+    if sample_col is None:
+        raise ValueError("no sample id column found (accession_id/run_id)")
+
+    rows_all = []
+
+    for dis in diseases:
+        sub = df[df[group_col].isin([healthy_label, dis])].copy()
+        if sub.empty:
+            continue
+
+        pivot = sub.pivot_table(index=[sample_col, group_col], columns=taxon_col, values=abundance_col, fill_value=0.0)
+
+        idx = pivot.index
+        grp_vals = idx.get_level_values(1).astype(str)
+        X = pivot.reset_index(level=1, drop=True)
+
+        mask_h = grp_vals == healthy_label
+        mask_d = grp_vals == dis
+
+        n_h = int(mask_h.sum())
+        n_d = int(mask_d.sum())
+        if n_h < int(min_n_per_group) or n_d < int(min_n_per_group):
+            continue
+
+        X_h = X.loc[mask_h]
+        X_d = X.loc[mask_d]
+
+        mean_h = X_h.mean(axis=0)
+        mean_d = X_d.mean(axis=0)
+        prev_h = (X_h > 0).mean(axis=0)
+        prev_d = (X_d > 0).mean(axis=0)
+
+        keep = (prev_h >= float(min_prevalence)) | (prev_d >= float(min_prevalence))
+        taxa_keep = X.columns[keep.values]
+
+        eps = 1e-6
+        pvals = []
+        tmp = []
+
+        for tax in taxa_keep:
+            a = X_h[tax].to_numpy()
+            b = X_d[tax].to_numpy()
+
+            p = np.nan
+            if a.size > 1 and b.size > 1:
+                try:
+                    p = float(mannwhitneyu(a, b, alternative="two-sided").pvalue)
+                except Exception:
+                    p = np.nan
+
+            mh = float(mean_h[tax])
+            md = float(mean_d[tax])
+            log2fc = float(np.log2((md + eps) / (mh + eps)))
+
+            tmp.append(
+                (
+                    dis,
+                    str(tax),
+                    mh,
+                    md,
+                    log2fc,
+                    p,
+                    n_h,
+                    n_d,
+                    float(prev_h[tax]),
+                    float(prev_d[tax]),
+                )
+            )
+            pvals.append(1.0 if np.isnan(p) else p)
+
+        if not tmp:
+            continue
+
+        qvals = benjamini_hochberg(np.asarray(pvals, dtype=float))
+        for i, row in enumerate(tmp):
+            rows_all.append(row + (float(qvals[i]),))
+
+    out = pd.DataFrame(
+        rows_all,
+        columns=[
+            "disease",
+            "taxon",
+            "mean_Healthy",
+            "mean_disease",
+            "log2fc",
+            "p_value",
+            "n_Healthy",
+            "n_disease",
+            "prev_Healthy",
+            "prev_disease",
+            "q_value",
+        ],
+    )
+    return out
+
+
+def taxon_enriched_depleted_summary(
+    stats_long: pd.DataFrame,
+    taxon: str,
+    q_cut: float = 0.05,
+    fc_cut: float = 0.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if stats_long is None or stats_long.empty:
+        empty = pd.DataFrame(columns=["disease", "log2fc", "q_value", "mean_Healthy", "mean_disease"])
+        return empty, empty
+
+    d = stats_long[stats_long["taxon"].astype(str) == str(taxon)].copy()
+    if d.empty:
+        empty = pd.DataFrame(columns=["disease", "log2fc", "q_value", "mean_Healthy", "mean_disease"])
+        return empty, empty
+
+    d["q_value"] = pd.to_numeric(d["q_value"], errors="coerce")
+    d["log2fc"] = pd.to_numeric(d["log2fc"], errors="coerce")
+
+    sig = d[d["q_value"] <= float(q_cut)].copy()
+
+    enriched = sig[sig["log2fc"] > float(fc_cut)].sort_values(["log2fc", "q_value"], ascending=[False, True])
+    depleted = sig[sig["log2fc"] < -float(fc_cut)].sort_values(["log2fc", "q_value"], ascending=[True, True])
+
+    cols = [
+        "disease",
+        "log2fc",
+        "q_value",
+        "mean_Healthy",
+        "mean_disease",
+        "prev_Healthy",
+        "prev_disease",
+        "n_Healthy",
+        "n_disease",
+    ]
+    return enriched[cols].reset_index(drop=True), depleted[cols].reset_index(drop=True)
+
+
+# ----------------------------
+# Pages
+# ----------------------------
+
+def page_home(samples: pd.DataFrame, abund: pd.DataFrame, taxa: pd.DataFrame) -> None:
+    st.title(APP_TITLE)
+    st.write("Minimal build with caching for faster interaction.")
+
+    total_samples = safe_unique_count(samples.get("run_id"))
+    total_projects = safe_unique_count(samples.get("project_id"))
+    total_phenotypes = safe_unique_count(samples.get("phenotype")) or safe_unique_count(samples.get("disease"))
+    unique_taxa = safe_unique_count(abund.get("ncbi_taxon_id"))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total samples (runs)", f"{total_samples:,}")
+    c2.metric("Studies (projects)", f"{total_projects:,}")
+    c3.metric("Phenotypes", f"{total_phenotypes:,}")
+    c4.metric("Unique taxa IDs", f"{unique_taxa:,}")
+
+    st.divider()
+
+    if "experiment_type" in samples.columns:
+        vc = samples["experiment_type"].fillna("Unknown").astype(str).value_counts()
+        fig = px.pie(names=vc.index.tolist(), values=vc.values.tolist(), title="Sequencing types")
+        st.plotly_chart(fig, use_container_width=True)
+
+    disease_col = "phenotype" if "phenotype" in samples.columns else ("disease" if "disease" in samples.columns else None)
+    if disease_col:
+        vc = samples[disease_col].fillna("Unknown").astype(str).value_counts().head(10)
+        top = pd.DataFrame({disease_col: vc.index.tolist(), "n_samples": vc.values.tolist()})
+        fig = px.bar(top, x=disease_col, y="n_samples", title=f"Top 10 {disease_col} by sample count")
+        fig.update_layout(xaxis_title=disease_col, yaxis_title="Number of samples")
+        st.plotly_chart(fig, use_container_width=True)
+
+    age_col = "host_age" if "host_age" in samples.columns else None
+    if age_col and samples[age_col].notna().any():
+        ages = pd.to_numeric(samples[age_col], errors="coerce").dropna()
+        fig = px.histogram(ages, nbins=30, title="Host age distribution")
+        fig.update_layout(xaxis_title="Age", yaxis_title="Count")
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def page_pairwise_group_comparison(samples: pd.DataFrame, abund: pd.DataFrame, taxa: pd.DataFrame) -> None:
+    st.header("Pairwise Group Comparison")
+
+    joined = build_joined(samples, abund, taxa)
+    group_col = get_group_col(joined)
+    if group_col is None:
+        st.error("Could not find 'phenotype' or 'disease' after joining.")
+        st.stop()
+
+    joined = apply_optional_filters(joined)
+    joined_ranked, rank_level, msg = filter_rank_level(joined)
+    if msg:
+        st.caption(msg)
+
+    groups = sorted(joined_ranked[group_col].dropna().astype(str).unique().tolist())
+    if len(groups) < 2:
+        st.error("Not enough groups to compare.")
+        st.stop()
+
+    default_a = "Healthy" if "Healthy" in groups else groups[0]
+    c1, c2 = st.columns(2)
+    with c1:
+        group_a = st.selectbox("Group A", groups, index=groups.index(default_a) if default_a in groups else 0)
+    with c2:
+        b_candidates = [g for g in groups if g != group_a]
+        group_b = st.selectbox("Group B", b_candidates, index=0)
+
+    st.caption("Test: Mann–Whitney U per taxon, BH-FDR for q-values.")
+
+    min_prev = st.slider("Minimum prevalence in either group", 0.0, 1.0, 0.1, 0.05)
+    top_k = st.slider("Number of taxa to display", 5, 50, 20, 5)
+    q_cut = st.slider("Significance threshold (q)", 0.0, 0.25, 0.05, 0.01)
+
+    if st.button("Run pairwise comparison"):
+        res = compute_group_comparison(
+            joined=joined_ranked,
+            group_col=group_col,
+            group_a=group_a,
+            group_b=group_b,
+            taxon_name_col="scientific_name",
+            abundance_col="relative_abundance",
+            min_prevalence=float(min_prev),
+        )
+
+        if res.empty:
+            st.warning("No taxa passed filters or insufficient data.")
+            st.stop()
+
+        res2 = res.copy()
+        res2["abs_log2fc"] = res2["log2fc"].abs()
+        sig = res2[pd.to_numeric(res2["qvalue"], errors="coerce") <= q_cut]
+
+        show = (
+            sig.sort_values("abs_log2fc", ascending=False).head(top_k)
+            if len(sig) > 0
+            else res2.sort_values("abs_log2fc", ascending=False).head(top_k)
+        ).sort_values("log2fc")
+
+        st.subheader("Top changing taxa")
+        fig = px.bar(show, x="scientific_name", y="log2fc", title=f"Log2 fold change: {group_b} vs {group_a}")
+        fig.update_layout(xaxis_title="Taxon", yaxis_title="log2 fold change")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Volcano plot")
+        volc = res2.copy()
+        qv = pd.to_numeric(volc["qvalue"], errors="coerce").fillna(1.0).to_numpy()
+        volc["neglog10_q"] = -np.log10(np.clip(qv, 1e-300, 1.0))
+        fig2 = px.scatter(volc, x="log2fc", y="neglog10_q", hover_data=["scientific_name", "pvalue", "qvalue"])
+        fig2.update_layout(xaxis_title="log2 fold change", yaxis_title="-log10(q)")
+        st.plotly_chart(fig2, use_container_width=True)
+
+        st.subheader("Results table")
+        st.dataframe(res, use_container_width=True)
+
+        csv_bytes = res.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download results as CSV",
+            data=csv_bytes,
+            file_name=f"group_comparison_{group_a}_vs_{group_b}.csv".replace(" ", "_"),
+            mime="text/csv",
+        )
+
+
+def page_disease_taxon_atlas(samples: pd.DataFrame, abund: pd.DataFrame, taxa: pd.DataFrame) -> None:
+    st.header("Disease & Taxon Atlas")
+
+    joined = build_joined(samples, abund, taxa)
+    group_col = get_group_col(joined)
+    if group_col is None:
+        st.error("Could not find 'phenotype' or 'disease' after joining.")
+        st.stop()
+
+    joined = apply_optional_filters(joined)
+    joined_ranked, rank_level, msg = filter_rank_level(joined)
+    if msg:
+        st.caption(msg)
+
+    groups = sorted(joined_ranked[group_col].dropna().astype(str).unique().tolist())
+    healthy_label = "Healthy"
+    has_healthy = healthy_label in groups
+
+    st.subheader("A) Disease composition (top taxa)")
+    diseases = sorted([g for g in groups if g != healthy_label])
+    if not diseases:
+        st.info("No disease groups found (only Healthy detected).")
+    else:
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            dis = st.selectbox("Disease", diseases)
+        with c2:
+            top_n = st.slider("Top N taxa", 10, 100, 30, 5)
+        with c3:
+            agg = st.selectbox("Aggregation", ["mean", "median"], index=0)
+
+        comp = disease_composition_table(
+            joined=joined_ranked,
+            group_col=group_col,
+            disease=dis,
+            rank_level=rank_level,
+            top_n=int(top_n),
+            agg=str(agg),
+            drop_unknown=True,
+        )
+
+        st.dataframe(comp, use_container_width=True)
+        if not comp.empty:
+            figc = px.bar(comp.sort_values("abundance"), x="taxon", y="abundance", title=f"{dis}: Top taxa abundance ({agg})")
+            figc.update_layout(xaxis_title="Taxon", yaxis_title="Abundance", xaxis={"categoryorder": "total ascending"})
+            st.plotly_chart(figc, use_container_width=True)
+
+    st.divider()
+    st.subheader("B) For one taxon: enriched or depleted across diseases (vs Healthy)")
+
+    if not has_healthy:
+        st.warning("No Healthy group found. This section requires Healthy as reference.")
+        return
+
+    left, right = st.columns(2)
+    with left:
+        min_prev_global = st.slider("Min prevalence (either group)", 0.0, 1.0, 0.1, 0.05)
+        min_n = st.slider("Min samples per group", 3, 30, 8, 1)
+    with right:
+        q_cut_global = st.slider("q cutoff", 0.0, 0.25, 0.05, 0.01)
+        fc_cut_global = st.slider("abs(log2fc) cutoff", 0.0, 2.0, 0.0, 0.1)
+
+    if st.button("Build or refresh disease vs Healthy matrix"):
+        with st.spinner("Computing all diseases vs Healthy (cached for these settings)..."):
+            stats_long = taxon_enrichment_matrix_vs_healthy(
+                joined=joined_ranked,
+                group_col=group_col,
+                rank_level=rank_level,
+                healthy_label=healthy_label,
+                min_prevalence=float(min_prev_global),
+                min_n_per_group=int(min_n),
+                drop_unknown=True,
+            )
+        st.session_state["stats_long"] = stats_long
+        st.success(f"Built matrix with {len(stats_long):,} rows.")
+
+    stats_long = st.session_state.get("stats_long", None)
+    if stats_long is None:
+        st.info("Click the button above to build the matrix.")
+        return
+    if stats_long.empty:
+        st.info("Matrix is empty. Lower min_n or min_prevalence and rebuild.")
+        return
+
+    taxa_list = sorted(stats_long["taxon"].dropna().astype(str).unique().tolist())
+    tax = st.selectbox("Taxon", taxa_list)
+
+    enriched, depleted = taxon_enriched_depleted_summary(
+        stats_long=stats_long,
+        taxon=tax,
+        q_cut=float(q_cut_global),
+        fc_cut=float(fc_cut_global),
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("Enriched diseases")
+        st.dataframe(enriched, use_container_width=True)
+    with c2:
+        st.write("Depleted diseases")
+        st.dataframe(depleted, use_container_width=True)
+
+    with st.expander("Show all diseases for this taxon (including non-significant)"):
+        all_d = stats_long[stats_long["taxon"].astype(str) == str(tax)].copy()
+        all_d["q_value"] = pd.to_numeric(all_d["q_value"], errors="coerce")
+        all_d["log2fc"] = pd.to_numeric(all_d["log2fc"], errors="coerce")
+        all_d = all_d.sort_values(["q_value", "log2fc"], ascending=[True, False])
+        st.dataframe(all_d, use_container_width=True)
+
+
+# ----------------------------
+# Sidebar + Main
+# ----------------------------
+
+def sidebar(paths: DataPaths) -> str:
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio(
+        "Go to",
+        ["Home / Overview", "Disease & Taxon Atlas", "Pairwise Group Comparison"],
+        index=0,
+    )
+
+    st.sidebar.divider()
+    st.sidebar.caption("Data files")
+    st.sidebar.write(f"sample_metadata: {paths.sample_metadata}")
+    st.sidebar.write(f"abundance: {paths.abundance}")
+    st.sidebar.write(f"taxonomy: {paths.taxonomy}")
+
+    st.sidebar.divider()
+    st.sidebar.caption("Tips")
+    st.sidebar.write("Caching is enabled for loading and joins for faster page switching.")
+    st.sidebar.write("If results look empty, verify: abundance.accession_id == sample_metadata.run_id.")
+
+    # Optional: allow clearing cache in UI
+    if st.sidebar.button("Clear cache"):
+        st.cache_data.clear()
+        st.sidebar.success("Cache cleared. Rerun actions to rebuild.")
+
+    return page
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    page = sidebar(DATA_PATHS)
+
+    try:
+        samples, abund, taxa = load_data(DATA_PATHS)
+    except Exception as e:
+        st.error(f"Failed to load data: {e}")
+        return
+
+    if "run_id" not in samples.columns:
+        st.warning("sample_metadata missing 'run_id'. If your key differs, update join_abundance_with_samples.")
+    for c in ["accession_id", "ncbi_taxon_id", "relative_abundance"]:
+        if c not in abund.columns:
+            st.warning(f"abundance missing '{c}'.")
+
+    if page == "Home / Overview":
+        page_home(samples, abund, taxa)
+    
+    elif page == "Disease & Taxon Atlas":
+        page_disease_taxon_atlas(samples, abund, taxa)
+    elif page == "Pairwise Group Comparison":
+        page_pairwise_group_comparison(samples, abund, taxa)
+
+
+
+if __name__ == "__main__":
+    main()
