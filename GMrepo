@@ -1,6 +1,6 @@
-# streamlit run /Users/yuqitao/Desktop/GMrepo_web.py
-#
-# GMRepo v2 Minimal Explorer (Separated Pages, Faster, Polished UI)
+# streamlit run /Users/yuqitao/Desktop/GMrepo.py
+
+# GMRepo v3 Minimal Explorer (Separated Pages, Faster, Polished UI)
 # Pages:
 #   1) Home / Overview
 #   2) Disease & Taxon Atlas
@@ -45,7 +45,7 @@ DATA_PATHS = DataPaths(
     taxonomy=os.path.join(BASE_DIR, "taxonomy.tsv"),
 )
 
-APP_TITLE = "Gut Microbiome Interactive Explorer (GMRepo v2) - Minimal"
+APP_TITLE = "Gut Microbiome Interactive Explorer (GMRepo v3) - Minimal"
 
 
 # ----------------------------
@@ -97,6 +97,11 @@ def benjamini_hochberg(pvals: np.ndarray) -> np.ndarray:
     return out
 
 
+def format_scientific(series: pd.Series, digits: int = 2) -> pd.Series:
+    vals = pd.to_numeric(series, errors="coerce")
+    return vals.map(lambda x: f"{x:.{digits}e}" if pd.notna(x) else "")
+
+
 # ----------------------------
 # Cached loading
 # ----------------------------
@@ -137,9 +142,9 @@ def load_data(paths: DataPaths) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFram
 # Filter-first join (saves memory/time)
 # ----------------------------
 
-def collect_sample_filters(samples: pd.DataFrame) -> dict:
+def collect_sample_filters(samples: pd.DataFrame, *, expanded: bool = False, key_prefix: str = "flt") -> dict:
     filters: dict = {}
-    with st.expander("Optional filters", expanded=False):
+    with st.expander("Optional filters", expanded=expanded):
         for col, label in [
             ("experiment_type", "Experiment type"),
             ("country", "Country"),
@@ -147,7 +152,7 @@ def collect_sample_filters(samples: pd.DataFrame) -> dict:
         ]:
             if col in samples.columns and samples[col].notna().any():
                 options = ["All"] + sorted(samples[col].dropna().astype(str).unique().tolist())
-                choice = st.selectbox(label, options, key=f"flt_{col}")
+                choice = st.selectbox(label, options, key=f"{key_prefix}_{col}")
                 filters[col] = choice
             else:
                 st.caption(f"No {col} column available (or all empty).")
@@ -433,144 +438,129 @@ def disease_composition_table(
 # ----------------------------
 
 @st.cache_data(show_spinner=False)
-def taxon_enrichment_matrix_vs_healthy(
+def taxon_vs_healthy_one_taxon(
     joined: pd.DataFrame,
     group_col: str,
+    taxon: str,
+    *,
     rank_level: Optional[str] = None,
     healthy_label: str = "Healthy",
     taxon_col: str = "scientific_name",
     abundance_col: str = "relative_abundance",
-    min_prevalence: float = 0.1,
     min_n_per_group: int = 8,
+    min_prevalence: float = 0.1,
     drop_unknown: bool = True,
 ) -> pd.DataFrame:
     """
-    For each disease group (vs Healthy), compute mean_Healthy, mean_disease, log2fc,
-    Mann-Whitney p_value, BH q_value, and prevalence in each group.
-    Output is long-form: one row per (disease, taxon).
+    Compute disease-vs-Healthy stats for ONE selected taxon only.
+    This avoids building a huge sample x taxa matrix and is much faster.
+    Output: one row per disease for this taxon.
     """
+
     df = joined.copy()
 
-    for c in [group_col, taxon_col, abundance_col]:
+    # validate
+    for c in ["accession_id", group_col, taxon_col, abundance_col]:
         if c not in df.columns:
             raise ValueError(f"joined missing column: {c}")
 
+    # rank filter
     if rank_level is not None and "taxon_rank_level" in df.columns:
         df = df[df["taxon_rank_level"].astype(str) == str(rank_level)]
 
     df[group_col] = df[group_col].astype(str)
-    groups = sorted(df[group_col].dropna().unique().tolist())
-    if healthy_label not in groups:
-        raise ValueError(f"No '{healthy_label}' found in {group_col}")
-
-    diseases = [g for g in groups if g != healthy_label]
-    if not diseases:
-        return pd.DataFrame()
-
+    df[taxon_col] = df[taxon_col].astype(str)
     df[abundance_col] = pd.to_numeric(df[abundance_col], errors="coerce")
-    df = df.dropna(subset=[taxon_col, abundance_col, "accession_id", group_col])
+    df = df.dropna(subset=["accession_id", group_col])
 
     if drop_unknown:
-        df = df[~df[taxon_col].astype(str).isin(["Unknown", "unclassified"])]
+        bad = {"Unknown", "unclassified", "nan", "None"}
+        df = df[~df[taxon_col].isin(bad)]
 
-    sample_col = "accession_id"
-    rows_all = []
+    # sample labels (one row per sample)
+    labels = df.drop_duplicates("accession_id")[["accession_id", group_col]].copy()
+    labels = labels[labels[group_col].notna()]
+
+    if labels.empty:
+        return pd.DataFrame(columns=[
+            "disease", "taxon", "mean_Healthy", "mean_disease", "log2fc",
+            "p_value", "q_value", "n_Healthy", "n_disease",
+            "prev_Healthy", "prev_disease"
+        ])
+
+    if healthy_label not in set(labels[group_col].astype(str)):
+        raise ValueError(f"No '{healthy_label}' found in {group_col}")
+
+    # abundance for the ONE taxon per sample (mean if duplicated rows)
+    tax_rows = df[df[taxon_col] == str(taxon)][["accession_id", abundance_col]].copy()
+    tax_per_sample = tax_rows.groupby("accession_id", as_index=False)[abundance_col].mean()
+
+    # merge onto all samples, fill missing with 0
+    m = labels.merge(tax_per_sample, on="accession_id", how="left")
+    m[abundance_col] = m[abundance_col].fillna(0.0)
+
+    # split Healthy vector once
+    h = m[m[group_col] == str(healthy_label)][abundance_col].to_numpy(dtype=float)
+    n_h = int(h.size)
+    if n_h < int(min_n_per_group):
+        return pd.DataFrame(columns=[
+            "disease", "taxon", "mean_Healthy", "mean_disease", "log2fc",
+            "p_value", "q_value", "n_Healthy", "n_disease",
+            "prev_Healthy", "prev_disease"
+        ])
+
+    mean_h = float(np.mean(h))
+    prev_h = float(np.mean(h > 0))
+
+    eps = 1e-6
+    rows = []
+    pvals = []
+
+    diseases = sorted([g for g in m[group_col].unique().tolist() if g != str(healthy_label)])
 
     for dis in diseases:
-        sub = df[df[group_col].isin([healthy_label, dis])].copy()
-        if sub.empty:
+        dvec = m[m[group_col] == str(dis)][abundance_col].to_numpy(dtype=float)
+        n_d = int(dvec.size)
+        if n_d < int(min_n_per_group):
             continue
 
-        pivot = sub.pivot_table(
-            index=[sample_col, group_col],
-            columns=taxon_col,
-            values=abundance_col,
-            fill_value=0.0,
-        )
+        mean_d = float(np.mean(dvec))
+        prev_d = float(np.mean(dvec > 0))
 
-        idx = pivot.index
-        grp_vals = idx.get_level_values(1).astype(str)
-        X = pivot.reset_index(level=1, drop=True)
-
-        mask_h = grp_vals == healthy_label
-        mask_d = grp_vals == dis
-
-        n_h = int(mask_h.sum())
-        n_d = int(mask_d.sum())
-        if n_h < int(min_n_per_group) or n_d < int(min_n_per_group):
+        # prevalence filter (either side)
+        if (prev_h < float(min_prevalence)) and (prev_d < float(min_prevalence)):
             continue
 
-        X_h = X.loc[mask_h]
-        X_d = X.loc[mask_d]
-
-        mean_h = X_h.mean(axis=0)
-        mean_d = X_d.mean(axis=0)
-        prev_h = (X_h > 0).mean(axis=0)
-        prev_d = (X_d > 0).mean(axis=0)
-
-        keep = (prev_h >= float(min_prevalence)) | (prev_d >= float(min_prevalence))
-        taxa_keep = X.columns[keep.values]
-
-        eps = 1e-6
-        pvals_for_bh = []
-        tmp_rows = []
-
-        for tax in taxa_keep:
-            a = X_h[tax].to_numpy()
-            b = X_d[tax].to_numpy()
-
+        try:
+            _stat, p = mannwhitneyu(h, dvec, alternative="two-sided")
+            p = float(p)
+        except Exception:
             p = np.nan
-            if a.size > 1 and b.size > 1:
-                try:
-                    p = float(mannwhitneyu(a, b, alternative="two-sided").pvalue)
-                except Exception:
-                    p = np.nan
 
-            mh = float(mean_h[tax])
-            md = float(mean_d[tax])
-            log2fc = float(np.log2((md + eps) / (mh + eps)))
+        log2fc = float(np.log2((mean_d + eps) / (mean_h + eps)))
 
-            tmp_rows.append(
-                (
-                    dis,
-                    str(tax),
-                    mh,
-                    md,
-                    log2fc,
-                    p,
-                    n_h,
-                    n_d,
-                    float(prev_h[tax]),
-                    float(prev_d[tax]),
-                )
-            )
-            pvals_for_bh.append(1.0 if np.isnan(p) else p)
+        rows.append((
+            str(dis), str(taxon), mean_h, mean_d, log2fc,
+            p, n_h, n_d, prev_h, prev_d
+        ))
+        pvals.append(p)
 
-        if not tmp_rows:
-            continue
+    if not rows:
+        return pd.DataFrame(columns=[
+            "disease", "taxon", "mean_Healthy", "mean_disease", "log2fc",
+            "p_value", "q_value", "n_Healthy", "n_disease",
+            "prev_Healthy", "prev_disease"
+        ])
 
-        qvals = benjamini_hochberg(np.asarray(pvals_for_bh, dtype=float))
-        for i, row in enumerate(tmp_rows):
-            rows_all.append(row + (float(qvals[i]),))
+    out = pd.DataFrame(rows, columns=[
+        "disease", "taxon", "mean_Healthy", "mean_disease", "log2fc",
+        "p_value", "n_Healthy", "n_disease", "prev_Healthy", "prev_disease"
+    ])
 
-    out = pd.DataFrame(
-        rows_all,
-        columns=[
-            "disease",
-            "taxon",
-            "mean_Healthy",
-            "mean_disease",
-            "log2fc",
-            "p_value",
-            "n_Healthy",
-            "n_disease",
-            "prev_Healthy",
-            "prev_disease",
-            "q_value",
-        ],
-    )
-    return out
+    q = benjamini_hochberg(np.where(pd.isna(out["p_value"]).to_numpy(), 1.0, out["p_value"].to_numpy(dtype=float)))
+    out["q_value"] = q.astype(float)
 
+    return out.sort_values(["q_value", "p_value"], ascending=[True, True], na_position="last").reset_index(drop=True)
 
 def taxon_enriched_depleted_summary(
     stats_long: pd.DataFrame,
@@ -677,15 +667,90 @@ def page_disease_taxon_atlas(samples: pd.DataFrame, abund: pd.DataFrame, taxa: p
 Explore microbiome composition within a selected disease/group.
 
 Workflow:
-1) Apply optional filters.
-2) Choose a taxonomic rank level.
-3) Select a disease/group and click "Show results".
+1) Choose a disease/group and taxon rank level.
+2) (Optional) Adjust analysis settings and cohort filters.
+3) Click "Show results" to compute and display outputs.
         """
     )
 
     st.divider()
 
-    filters = collect_sample_filters(samples)
+    # Rank-level options from taxonomy (fast, UI renders immediately)
+    if "taxon_rank_level" in taxa.columns and taxa["taxon_rank_level"].notna().any():
+        rank_levels_all = sorted(taxa["taxon_rank_level"].dropna().astype(str).unique().tolist())
+    else:
+        rank_levels_all = []
+
+    # Group options from sample_metadata (fast, UI renders immediately)
+    if "phenotype" in samples.columns and samples["phenotype"].notna().any():
+        group_options_all = sorted(samples["phenotype"].dropna().astype(str).unique().tolist())
+    elif "disease" in samples.columns and samples["disease"].notna().any():
+        group_options_all = sorted(samples["disease"].dropna().astype(str).unique().tolist())
+    else:
+        group_options_all = []
+
+    healthy_label = "Healthy"
+    diseases_only = [g for g in group_options_all if g != healthy_label]
+    selectable_groups = diseases_only if diseases_only else group_options_all
+
+    if not selectable_groups:
+        st.warning("No disease/phenotype groups found in sample_metadata.")
+        return
+
+    # ---- All UI controls render immediately (single form) ----
+    with st.form("atlas_form_all_controls"):
+        st.subheader("Selections")
+
+        # Disease/group at the TOP + rank level beside it (trimmed UI)
+        c1, c2, _ = st.columns([2, 2, 1])
+        with c1:
+            selectable_groups = sorted([str(x) for x in selectable_groups if pd.notna(x)])
+            dis = st.selectbox(
+                "Disease / group",
+                selectable_groups,
+                index=None,  # no default selection, encourages typing
+                placeholder="Type e.g. 'Alc' to find Alcoholism",
+                key="atlas_dis",
+            )
+        with c2:
+            if rank_levels_all:
+                rank_level = st.selectbox("Taxon rank level", rank_levels_all, index=0, key="rank_level_atlas")
+            else:
+                rank_level = None
+                st.caption("No taxon_rank_level found. Using all rows.")
+
+        # Advanced settings (collapsed by default)
+        with st.expander("Advanced settings", expanded=False):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                top_n2 = st.slider("Top N", 10, 500, 100, 10, key="atlas_topn_detail")
+            with c2:
+                agg2 = st.selectbox("Aggregation", ["mean", "median"], index=0, key="atlas_agg_detail")
+            with c3:
+                drop_unknown = st.checkbox("Drop Unknown/unclassified", value=True, key="atlas_dropunk")
+
+            with st.expander("Extra filters (within this disease/group)", expanded=False):
+                min_prev = st.slider("Minimum prevalence", 0.0, 1.0, 0.0, 0.05, key="atlas_minprev_detail")
+                min_abund = st.number_input(
+                    "Minimum abundance",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.0001,
+                    key="atlas_minabund_detail",
+                )
+                query = st.text_input("Search taxon name contains", value="", key="atlas_query_detail").strip().lower()
+
+        # Optional cohort filters (collapsed)
+        filters = collect_sample_filters(samples, expanded=False, key_prefix="atlas_flt")
+
+        st.divider()
+        show_results = st.form_submit_button("Show results", type="primary")
+
+    if not show_results:
+        st.info('Adjust selections and click "Show results". Expensive computation runs only after submit.')
+        return
+
+    # ---- expensive work starts here (after submit) ----
     joined = get_filtered_abundance(samples, abund, taxa, filters)
     if joined.empty:
         st.warning("No rows after filtering. Try loosening filters.")
@@ -696,69 +761,20 @@ Workflow:
         st.error("Could not find 'phenotype' or 'disease' after filtering.")
         st.stop()
 
-    joined_ranked, rank_level, msg = filter_rank_level(joined, key="rank_level_atlas")
-    if msg:
-        st.caption(msg)
+    # Apply rank filter after join
+    if rank_level is not None and "taxon_rank_level" in joined.columns:
+        joined_ranked = joined[joined["taxon_rank_level"].astype(str) == str(rank_level)].copy()
+    else:
+        joined_ranked = joined
 
-    groups = sorted(joined_ranked[group_col].dropna().astype(str).unique().tolist())
-    if not groups:
-        st.warning("No groups found after filtering.")
+    # Validate selected group exists after filtering
+    groups_after = sorted(joined_ranked[group_col].dropna().astype(str).unique().tolist())
+    if str(dis) not in set(groups_after):
+        st.warning("Selected disease/group has no samples after filtering. Try loosening filters.")
         return
 
-    healthy_label = "Healthy"
-    diseases = sorted([g for g in groups if g != healthy_label])
-    selectable = diseases if diseases else groups
-
-    st.subheader("Selections")
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-    with c1:
-        dis = st.selectbox("Disease / group", selectable, key="atlas_dis")
-    with c2:
-        top_n = st.slider("Top N taxa", 10, 200, 30, 5, key="atlas_topn")
-    with c3:
-        agg = st.selectbox("Aggregation", ["mean", "median"], index=0, key="atlas_agg")
-    with c4:
-        drop_unknown = st.checkbox("Drop Unknown/unclassified", value=True, key="atlas_dropunk")
-
-    show_results = st.button("Show results", type="primary", key="atlas_show")
-    if not show_results:
-        st.info('Select a disease/group and click "Show results" to display charts and tables.')
-        return
-
-    st.subheader("A) Disease composition (top taxa)")
-    comp = disease_composition_table(
-        joined=joined_ranked,
-        group_col=group_col,
-        disease=dis,
-        rank_level=rank_level,
-        top_n=int(top_n),
-        agg=str(agg),
-        drop_unknown=bool(drop_unknown),
-    )
-    if comp.empty:
-        st.warning("No data for this selection. Try different filters or rank level.")
-        return
-
-    st.dataframe(comp, use_container_width=True)
-    figc = px.bar(
-        comp.sort_values("abundance"),
-        x="taxon",
-        y="abundance",
-        title=f"{dis}: Top taxa abundance ({agg})",
-    )
-    figc.update_layout(xaxis_title="Taxon", yaxis_title="Abundance", xaxis={"categoryorder": "total ascending"})
-    st.plotly_chart(figc, use_container_width=True)
-
-    st.divider()
-
-    st.subheader("B) Single disease composition (detailed view)")
-    st.caption("Abundance and prevalence within the selected disease/group only.")
-
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        top_n2 = st.slider("Top N (detailed)", 10, 500, 100, 10, key="atlas_topn_detail")
-    with c2:
-        agg2 = st.selectbox("Aggregation (detailed)", ["mean", "median"], index=0, key="atlas_agg_detail")
+    st.subheader("Disease composition")
+    st.caption("Filtered detailed table and charts for the selected disease/group.")
 
     comp2 = disease_composition_table(
         joined=joined_ranked,
@@ -770,26 +786,31 @@ Workflow:
         drop_unknown=bool(drop_unknown),
     )
     if comp2.empty:
-        st.warning("No data available for the detailed view. Try different filters or rank level.")
+        st.warning("No data available for this selection. Try different filters or rank level.")
         return
-
-    with st.expander("Extra filters (within this disease/group)", expanded=False):
-        min_prev = st.slider("Minimum prevalence", 0.0, 1.0, 0.0, 0.05, key="atlas_minprev_detail")
-        min_abund = st.number_input("Minimum abundance", min_value=0.0, value=0.0, step=0.0001, key="atlas_minabund_detail")
-        query = st.text_input("Search taxon name contains", value="", key="atlas_query_detail").strip().lower()
 
     comp_view = comp2.copy()
     comp_view["prevalence"] = pd.to_numeric(comp_view["prevalence"], errors="coerce")
     comp_view["abundance"] = pd.to_numeric(comp_view["abundance"], errors="coerce")
 
-    if min_prev > 0:
+    if float(min_prev) > 0:
         comp_view = comp_view[comp_view["prevalence"] >= float(min_prev)]
-    if min_abund > 0:
+    if float(min_abund) > 0:
         comp_view = comp_view[comp_view["abundance"] >= float(min_abund)]
     if query:
         comp_view = comp_view[comp_view["taxon"].astype(str).str.lower().str.contains(query, na=False)]
 
     st.caption(f"Rows shown: {len(comp_view):,} (from top {int(top_n2)} before extra filtering)")
+
+    csv_bytes = comp_view.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download composition CSV",
+        data=csv_bytes,
+        file_name=f"{dis}_composition.csv".replace(" ", "_"),
+        mime="text/csv",
+        key="atlas_dl_detail_comp",
+    )
+
     st.dataframe(comp_view, use_container_width=True)
 
     if not comp_view.empty:
@@ -812,16 +833,7 @@ Workflow:
         figp.update_layout(xaxis_title="Taxon", yaxis_title="Prevalence", xaxis={"categoryorder": "total ascending"})
         st.plotly_chart(figp, use_container_width=True)
 
-    csv_bytes = comp_view.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download detailed composition CSV",
-        data=csv_bytes,
-        file_name=f"{dis}_composition_detailed.csv".replace(" ", "_"),
-        mime="text/csv",
-        key="atlas_dl_detail_comp",
-    )
-
-
+    
 def page_taxon_across_diseases(samples: pd.DataFrame, abund: pd.DataFrame, taxa: pd.DataFrame) -> None:
     st.header("Taxon Across Diseases (Enriched/Depleted vs Healthy)")
 
@@ -838,7 +850,84 @@ Workflow:
 
     st.divider()
 
-    filters = collect_sample_filters(samples)
+    # Build rank-level choices without needing the joined table (fast UI load)
+    if "taxon_rank_level" in taxa.columns and taxa["taxon_rank_level"].notna().any():
+        rank_levels_all = sorted(taxa["taxon_rank_level"].dropna().astype(str).unique().tolist())
+    else:
+        rank_levels_all = []
+
+    with st.form("taxon_form_all_controls"):
+        st.subheader("Selections")
+
+    
+        if rank_levels_all:
+            rank_level = st.selectbox("Taxon rank level", rank_levels_all, index=0, key="rank_level_taxonpage")
+        else:
+            rank_level = None
+
+        # taxon options from taxonomy (fast)
+        taxa_pool = taxa.copy()
+        if rank_level is not None and "taxon_rank_level" in taxa_pool.columns:
+            taxa_pool = taxa_pool[taxa_pool["taxon_rank_level"].astype(str) == str(rank_level)]
+
+        taxa_options = (
+            taxa_pool.get("scientific_name", pd.Series([], dtype="string"))
+            .astype(str)
+            .replace({"nan": np.nan})
+            .dropna()
+            .loc[lambda s: ~s.isin(["Unknown", "unclassified"])]
+            .unique()
+            .tolist()
+        )
+        taxa_options = sorted(taxa_options)
+
+        
+        if not taxa_options:
+            st.info("No taxa available at this rank level.")
+            no_taxa = True
+            taxon = None
+        else:
+            no_taxa = False
+            taxon = st.selectbox(
+                "Taxon (species/genus)",
+                taxa_options,
+                index=None,
+                placeholder="Type to search, e.g. 'Esch' or 'Bac'",
+                key="taxonpage_taxon",
+            )
+
+        # Advanced settings: collapsed by default, contains q-cut, fc-cut, min prevalence
+        with st.expander("Advanced settings", expanded=False):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                q_cut = st.slider("q-value cutoff", 0.00, 0.25, 0.05, 0.01, key="taxonpage_qcut")
+            with c2:
+                fc_cut = st.slider("log2FC threshold", 0.00, 3.00, 0.00, 0.10, key="taxonpage_fccut")
+            with c3:
+                min_prev = st.slider("Min prevalence", 0.00, 1.00, 0.10, 0.05, key="taxonpage_minprev")
+
+            min_n = st.number_input(
+                "Min samples per group (Healthy and disease)",
+                min_value=2,
+                value=8,
+                step=1,
+                key="taxonpage_minn",
+            )
+            drop_unknown = st.checkbox("Drop Unknown/unclassified", value=True, key="taxonpage_dropunk")
+
+        # Optional cohort filters after Advanced settings
+        filters = collect_sample_filters(samples, expanded=False, key_prefix="taxonpage_flt")
+
+        show = st.form_submit_button("Show results", type="primary")
+
+    if no_taxa:
+        return
+
+    if not show:
+        st.info('Update selections as needed, then click "Show results". No expensive computation runs until you submit.')
+        return
+
+    # expensive work starts here
     joined = get_filtered_abundance(samples, abund, taxa, filters)
     if joined.empty:
         st.warning("No rows after filtering. Try loosening filters.")
@@ -849,9 +938,10 @@ Workflow:
         st.error("Could not find 'phenotype' or 'disease' after filtering.")
         st.stop()
 
-    joined_ranked, rank_level, msg = filter_rank_level(joined, key="rank_level_taxonpage")
-    if msg:
-        st.caption(msg)
+    if rank_level is not None and "taxon_rank_level" in joined.columns:
+        joined_ranked = joined[joined["taxon_rank_level"].astype(str) == str(rank_level)].copy()
+    else:
+        joined_ranked = joined
 
     groups = sorted(joined_ranked[group_col].dropna().astype(str).unique().tolist())
     healthy_label = "Healthy"
@@ -859,77 +949,27 @@ Workflow:
         st.error(f"'{healthy_label}' was not found in {group_col}. This page requires a Healthy baseline.")
         st.stop()
 
-    st.subheader("Selections")
-
-    # Taxon selection list (can be large; allow search)
-    taxa_options = (
-        joined_ranked["scientific_name"]
-        .astype(str)
-        .replace({"nan": np.nan})
-        .dropna()
-        .loc[lambda s: ~s.isin(["Unknown", "unclassified"])]
-        .unique()
-        .tolist()
-    )
-    taxa_options = sorted(taxa_options)
-
-    if not taxa_options:
-        st.warning("No taxa names available after filtering.")
-        return
-
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-    with c1:
-        query = st.text_input("Search taxon name contains", value="", key="taxonpage_query").strip().lower()
-
-    filtered_options = taxa_options
-    if query:
-        filtered_options = [t for t in taxa_options if query in str(t).lower()]
-        if not filtered_options:
-            st.info("No taxa match this search. Try a different keyword.")
-            return
-
-    with c1:
-        taxon = st.selectbox("Taxon (species/genus)", filtered_options, key="taxonpage_taxon")
-
-    with c2:
-        q_cut = st.slider("q-value cutoff", 0.0, 0.25, 0.05, 0.01, key="taxonpage_qcut")
-    with c3:
-        fc_cut = st.slider("log2FC threshold", 0.0, 3.0, 0.0, 0.1, key="taxonpage_fccut")
-    with c4:
-        min_prev = st.slider("Min prevalence", 0.0, 1.0, 0.1, 0.05, key="taxonpage_minprev")
-
-    with st.expander("Advanced settings", expanded=False):
-        min_n = st.number_input("Min samples per group (Healthy and disease)", min_value=2, value=8, step=1, key="taxonpage_minn")
-        drop_unknown = st.checkbox("Drop Unknown/unclassified", value=True, key="taxonpage_dropunk")
-
-    show = st.button("Show results", type="primary", key="taxonpage_show")
-    if not show:
-        st.info('Select a taxon and click "Show results" to display enriched/depleted diseases.')
-        return
-
-    # Compute long-form stats (cached)
     try:
-        stats_long = taxon_enrichment_matrix_vs_healthy(
+        stats_tax = taxon_vs_healthy_one_taxon(
             joined=joined_ranked,
             group_col=group_col,
+            taxon=taxon,
             rank_level=rank_level,
             healthy_label=healthy_label,
-            taxon_col="scientific_name",
-            abundance_col="relative_abundance",
             min_prevalence=float(min_prev),
             min_n_per_group=int(min_n),
             drop_unknown=bool(drop_unknown),
         )
     except Exception as e:
-        st.error(f"Failed to compute enrichment matrix: {e}")
+        st.error(f"Failed to compute disease-vs-Healthy comparisons: {e}")
         return
 
-    if stats_long is None or stats_long.empty:
+    if stats_tax is None or stats_tax.empty:
         st.warning("No disease-vs-Healthy comparisons passed minimum sample/prevalence thresholds.")
         return
 
     enriched, depleted = taxon_enriched_depleted_summary(
-        stats_long=stats_long,
+        stats_long=stats_tax,
         taxon=taxon,
         q_cut=float(q_cut),
         fc_cut=float(fc_cut),
@@ -944,20 +984,29 @@ Workflow:
         st.metric("Depleted diseases", int(len(depleted)))
 
     if enriched.empty and depleted.empty:
-        st.info("No diseases passed the current thresholds. Try relaxing q-value / log2FC / min prevalence / min N.")
-        # Still allow user to inspect raw per-disease rows for this taxon
-        raw_tax = stats_long[stats_long["taxon"].astype(str) == str(taxon)].copy()
-        if raw_tax.empty:
-            return
+        st.warning("No diseases passed the current thresholds.")
+        st.caption("Try increasing q-value cutoff, lowering log2FC threshold, or lowering minimum prevalence/sample-size.")
+
+        raw_tax = stats_tax.copy().sort_values(["q_value", "p_value"], ascending=[True, True], na_position="last")
         st.subheader("Raw per-disease results (no thresholding)")
-        raw_tax = raw_tax.sort_values(["q_value", "p_value"], ascending=[True, True], na_position="last")
-        st.dataframe(raw_tax, use_container_width=True)
+        raw_tax_show = raw_tax.copy()
+        raw_tax_show["p_value"] = format_scientific(raw_tax_show["p_value"])
+        raw_tax_show["q_value"] = format_scientific(raw_tax_show["q_value"])
+        st.dataframe(raw_tax_show, use_container_width=True)
+
+        st.download_button(
+            "Download raw per-disease results (this taxon)",
+            data=raw_tax.to_csv(index=False).encode("utf-8"),
+            file_name=f"{taxon}_all_diseases_vs_Healthy.csv".replace(" ", "_"),
+            mime="text/csv",
+            key="taxonpage_dl_raw_only",
+        )
         return
 
     if not enriched.empty:
         st.subheader("Enriched in diseases (vs Healthy)")
-        st.dataframe(enriched, use_container_width=True)
 
+        # chart
         fig_e = px.bar(
             enriched.sort_values("log2fc", ascending=True).tail(30),
             x="disease",
@@ -968,6 +1017,7 @@ Workflow:
         fig_e.update_layout(xaxis_title="Disease", yaxis_title="log2FC (disease vs Healthy)")
         st.plotly_chart(fig_e, use_container_width=True)
 
+        # download immediately after chart
         st.download_button(
             "Download enriched diseases CSV",
             data=enriched.to_csv(index=False).encode("utf-8"),
@@ -976,10 +1026,16 @@ Workflow:
             key="taxonpage_dl_enriched",
         )
 
+        # table after download
+        enriched_show = enriched.copy()
+        enriched_show["p_value"] = format_scientific(enriched_show["p_value"])
+        enriched_show["q_value"] = format_scientific(enriched_show["q_value"])
+        st.dataframe(enriched_show, use_container_width=True)
+
     if not depleted.empty:
         st.subheader("Depleted in diseases (vs Healthy)")
-        st.dataframe(depleted, use_container_width=True)
 
+        # chart
         fig_d = px.bar(
             depleted.sort_values("log2fc", ascending=True).head(30),
             x="disease",
@@ -990,6 +1046,7 @@ Workflow:
         fig_d.update_layout(xaxis_title="Disease", yaxis_title="log2FC (disease vs Healthy)")
         st.plotly_chart(fig_d, use_container_width=True)
 
+        # download immediately after chart
         st.download_button(
             "Download depleted diseases CSV",
             data=depleted.to_csv(index=False).encode("utf-8"),
@@ -998,12 +1055,21 @@ Workflow:
             key="taxonpage_dl_depleted",
         )
 
-    # Always show raw rows for this taxon (useful even if thresholds are applied)
+        # table after download
+        depleted_show = depleted.copy()
+        depleted_show["p_value"] = format_scientific(depleted_show["p_value"])
+        depleted_show["q_value"] = format_scientific(depleted_show["q_value"])
+        st.dataframe(depleted_show, use_container_width=True)
+
+    # raw results
     st.divider()
     st.subheader("Raw per-disease results for this taxon")
-    raw_tax = stats_long[stats_long["taxon"].astype(str) == str(taxon)].copy()
-    raw_tax = raw_tax.sort_values(["q_value", "p_value"], ascending=[True, True], na_position="last")
-    st.dataframe(raw_tax, use_container_width=True)
+    raw_tax = stats_tax.copy().sort_values(["q_value", "p_value"], ascending=[True, True], na_position="last")
+
+    raw_tax_show = raw_tax.copy()
+    raw_tax_show["p_value"] = format_scientific(raw_tax_show["p_value"])
+    raw_tax_show["q_value"] = format_scientific(raw_tax_show["q_value"])
+    st.dataframe(raw_tax_show, use_container_width=True)
 
     st.download_button(
         "Download raw per-disease results (this taxon)",
@@ -1013,114 +1079,241 @@ Workflow:
         key="taxonpage_dl_raw",
     )
 
+def page_pairwise_group_comparison(
+    samples: pd.DataFrame,
+    abund: pd.DataFrame,
+    taxa: pd.DataFrame,
+) -> None:
 
-def page_pairwise_group_comparison(samples: pd.DataFrame, abund: pd.DataFrame, taxa: pd.DataFrame) -> None:
     st.header("Pairwise Group Comparison")
 
     st.markdown(
         """
-Compare two groups (for example Healthy vs a disease) and identify taxa that differ.
+Compare two groups (for example Healthy(control) vs a disease)
+and identify taxa that differ.
 
-Steps:
-1) Apply optional filters.
-2) Choose a taxonomic rank level.
-3) Pick Group A and Group B.
-4) Click "Run pairwise comparison" to display results.
+Workflow:
+1) Select two groups and taxonomic rank.
+2) Adjust optional analysis settings.
+3) Click "Run comparison".
         """
     )
 
     st.divider()
 
-    filters = collect_sample_filters(samples)
+    # ---------- rank options ----------
+    if "taxon_rank_level" in taxa.columns and taxa["taxon_rank_level"].notna().any():
+        rank_levels_all = sorted(
+            taxa["taxon_rank_level"].dropna().astype(str).unique().tolist()
+        )
+    else:
+        rank_levels_all = []
+
+    # ---------- group options ----------
+    if "phenotype" in samples.columns and samples["phenotype"].notna().any():
+        group_options_all = sorted(
+            samples["phenotype"].dropna().astype(str).unique().tolist()
+        )
+    elif "disease" in samples.columns and samples["disease"].notna().any():
+        group_options_all = sorted(
+            samples["disease"].dropna().astype(str).unique().tolist()
+        )
+    else:
+        group_options_all = []
+
+    if len(group_options_all) < 2:
+        st.warning("Not enough groups available for comparison.")
+        return
+
+    # ======================================================
+    # FORM
+    # ======================================================
+    with st.form("pairwise_form"):
+
+        st.subheader("Selections")
+
+        c1, c2, c3 = st.columns([2, 2, 1])
+
+        # ---- Group A ----
+        with c1:
+            group_a = st.selectbox(
+                "Group A",
+                group_options_all,
+                index=None,
+                placeholder="Type e.g. 'Healthy'",
+                key="pair_group_a",
+            )
+
+        # ---- Group B (independent selection) ----
+        with c2:
+            group_b = st.selectbox(
+                "Group B",
+                group_options_all,
+                index=None,
+                placeholder="Type comparison group",
+                key="pair_group_b",
+            )
+
+        # ---- Rank ----
+        with c3:
+            if rank_levels_all:
+                rank_level = st.selectbox(
+                    "Taxon rank",
+                    rank_levels_all,
+                    key="pair_rank",
+                )
+            else:
+                rank_level = None
+
+        # ================= Advanced =================
+        with st.expander("Advanced settings", expanded=False):
+
+            c1, c2, c3 = st.columns(3)
+
+            with c1:
+                min_prev = st.slider(
+                    "Min prevalence",
+                    0.0, 1.0, 0.1, 0.05,
+                    key="pair_min_prev",
+                )
+
+            with c2:
+                q_cut = st.slider(
+                    "q-value cutoff",
+                    0.0, 0.25, 0.05, 0.01,
+                    key="pair_q_cut",
+                )
+
+            with c3:
+                top_k = st.slider(
+                    "Top taxa shown",
+                    5, 50, 20, 5,
+                    key="pair_top_k",
+                )
+
+        # ---------- Optional cohort filters ----------
+        filters = collect_sample_filters(
+            samples,
+            expanded=False,
+            key_prefix="pair_flt",
+        )
+
+        st.divider()
+        run = st.form_submit_button(
+            "Run pairwise comparison",
+            type="primary",
+        )
+
+    # ======================================================
+    # VALIDATION
+    # ======================================================
+    if not run:
+        st.info(
+            'Select Group A and Group B, then click "Run pairwise comparison".'
+        )
+        return
+
+    if group_a is None or group_b is None:
+        st.warning("Please select BOTH Group A and Group B.")
+        return
+
+    if str(group_a) == str(group_b):
+        st.warning("Group A and Group B must be different.")
+        return
+
+    # ======================================================
+    # EXPENSIVE COMPUTATION
+    # ======================================================
     joined = get_filtered_abundance(samples, abund, taxa, filters)
+
     if joined.empty:
-        st.warning("No rows after filtering. Try loosening filters.")
+        st.warning("No rows after filtering.")
         return
 
     group_col = get_group_col(joined)
     if group_col is None:
-        st.error("Could not find 'phenotype' or 'disease' after filtering.")
-        st.stop()
+        st.error("Could not determine grouping column.")
+        return
 
-    joined_ranked, rank_level, msg = filter_rank_level(joined, key="rank_level_pairwise")
-    if msg:
-        st.caption(msg)
+    if rank_level is not None and "taxon_rank_level" in joined.columns:
+        joined = joined[
+            joined["taxon_rank_level"].astype(str) == str(rank_level)
+        ].copy()
 
-    groups = sorted(joined_ranked[group_col].dropna().astype(str).unique().tolist())
-    if len(groups) < 2:
-        st.error("Not enough groups to compare.")
-        st.stop()
+    res = compute_group_comparison_vectorized(
+        df=joined,
+        group_col=group_col,
+        group_a=group_a,
+        group_b=group_b,
+        abundance_col="relative_abundance",
+        taxon_col="scientific_name",
+        min_prevalence=float(min_prev),
+    )
 
-    default_a = "Healthy" if "Healthy" in groups else groups[0]
-    c1, c2 = st.columns(2)
-    with c1:
-        group_a = st.selectbox(
-            "Group A",
-            groups,
-            index=groups.index(default_a) if default_a in groups else 0,
-            key="pair_group_a",
-        )
-    with c2:
-        b_candidates = [g for g in groups if g != group_a]
-        group_b = st.selectbox("Group B", b_candidates, index=0, key="pair_group_b")
+    if res.empty:
+        st.warning("No taxa passed filters.")
+        return
 
-    st.caption("Test: Mann-Whitney U per taxon, BH-FDR for q-values.")
+    # ======================================================
+    # RESULT PROCESSING
+    # ======================================================
+    res2 = res.copy()
+    res2["abs_log2fc"] = res2["log2fc"].abs()
 
-    min_prev = st.slider("Minimum prevalence in either group", 0.0, 1.0, 0.1, 0.05, key="pair_min_prev")
-    top_k = st.slider("Number of taxa to display", 5, 50, 20, 5, key="pair_top_k")
-    q_cut = st.slider("Significance threshold (q)", 0.0, 0.25, 0.05, 0.01, key="pair_q_cut")
+    sig = res2[
+        pd.to_numeric(res2["qvalue"], errors="coerce") <= q_cut
+    ]
 
-    if st.button("Run pairwise comparison", type="primary", key="pair_run"):
-        res = compute_group_comparison_vectorized(
-            df=joined_ranked,
-            group_col=group_col,
-            group_a=group_a,
-            group_b=group_b,
-            abundance_col="relative_abundance",
-            taxon_col="scientific_name",
-            min_prevalence=float(min_prev),
-        )
+    show = (
+        sig.sort_values("abs_log2fc", ascending=False).head(top_k)
+        if len(sig) > 0
+        else res2.sort_values("abs_log2fc", ascending=False).head(top_k)
+    ).sort_values("log2fc")
 
-        if res.empty:
-            st.warning("No taxa passed filters or insufficient data.")
-            st.stop()
+    # ======================================================
+    # OUTPUT
+    # ======================================================
+    st.subheader("Results table")
 
-        res2 = res.copy()
-        res2["abs_log2fc"] = res2["log2fc"].abs()
-        sig = res2[pd.to_numeric(res2["qvalue"], errors="coerce") <= q_cut]
+    res_show = res.copy()
+    res_show["pvalue"] = format_scientific(res_show["pvalue"])
+    res_show["qvalue"] = format_scientific(res_show["qvalue"])
 
-        show = (
-            sig.sort_values("abs_log2fc", ascending=False).head(top_k)
-            if len(sig) > 0
-            else res2.sort_values("abs_log2fc", ascending=False).head(top_k)
-        ).sort_values("log2fc")
+    st.dataframe(res_show, use_container_width=True)
 
-        st.subheader("Top changing taxa")
-        fig = px.bar(show, x="scientific_name", y="log2fc", title=f"Log2 fold change: {group_b} vs {group_a}")
-        fig.update_layout(xaxis_title="Taxon", yaxis_title="log2 fold change")
-        st.plotly_chart(fig, use_container_width=True)
+    st.download_button(
+        "Download results CSV",
+        data=res.to_csv(index=False).encode("utf-8"),
+        file_name=f"{group_a}_vs_{group_b}.csv".replace(" ", "_"),
+        mime="text/csv",
+    )
 
-        st.subheader("Volcano plot")
-        volc = res2.copy()
-        qv = pd.to_numeric(volc["qvalue"], errors="coerce").fillna(1.0).to_numpy()
-        volc["neglog10_q"] = -np.log10(np.clip(qv, 1e-300, 1.0))
-        fig2 = px.scatter(volc, x="log2fc", y="neglog10_q", hover_data=["scientific_name", "pvalue", "qvalue"])
-        fig2.update_layout(xaxis_title="log2 fold change", yaxis_title="-log10(q)")
-        st.plotly_chart(fig2, use_container_width=True)
+    # ---------- Bar plot ----------
+    st.subheader("Top changing taxa")
 
-        st.subheader("Results table")
-        st.dataframe(res, use_container_width=True)
+    fig = px.bar(
+        show,
+        x="scientific_name",
+        y="log2fc",
+        title=f"log2 Fold Change: {group_b} vs {group_a}",
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-        csv_bytes = res.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download results as CSV",
-            data=csv_bytes,
-            file_name=f"group_comparison_{group_a}_vs_{group_b}.csv".replace(" ", "_"),
-            mime="text/csv",
-            key="pair_dl_csv",
-        )
-    else:
-        st.info('Select groups and click "Run pairwise comparison" to display charts and results.')
+    # ---------- Volcano ----------
+    st.subheader("Volcano plot")
+
+    volc = res2.copy()
+    qv = pd.to_numeric(volc["qvalue"], errors="coerce").fillna(1.0)
+    volc["neglog10_q"] = -np.log10(np.clip(qv, 1e-300, 1.0))
+
+    fig2 = px.scatter(
+        volc,
+        x="log2fc",
+        y="neglog10_q",
+        hover_data=["scientific_name", "pvalue", "qvalue"],
+    )
+
+    st.plotly_chart(fig2, use_container_width=True)
 
 
 # ----------------------------
