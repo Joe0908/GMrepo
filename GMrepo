@@ -814,24 +814,49 @@ Workflow:
     st.dataframe(comp_view, use_container_width=True)
 
     if not comp_view.empty:
-        figb = px.bar(
-            comp_view.sort_values("abundance").tail(50),
+        top_n_plot = int(top_n2)
+
+        # Figure 1: Top taxa by abundance (uses mean/median from agg2)
+        plot_ab = (
+            comp_view.sort_values(["abundance", "prevalence"], ascending=[False, False])
+            .head(top_n_plot)
+            .copy()
+        )
+
+        fig_ab = px.bar(
+            plot_ab.iloc[::-1],  # reverse so biggest is at top/right visually
             x="taxon",
             y="abundance",
-            hover_data=["prevalence"],
-            title=f"{dis}: abundance ({agg2}), showing up to 50 taxa",
+            hover_data=["prevalence", "n_samples"],
+            title=f"Top {len(plot_ab)} taxa by abundance ({agg2}) in {dis}",
         )
-        figb.update_layout(xaxis_title="Taxon", yaxis_title="Abundance", xaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(figb, use_container_width=True)
+        fig_ab.update_layout(
+            xaxis_title="Taxon",
+            yaxis_title=f"Abundance ({agg2})",
+            xaxis={"categoryorder": "total ascending"},
+        )
+        st.plotly_chart(fig_ab, use_container_width=True)
 
-        figp = px.bar(
-            comp_view.sort_values("prevalence").tail(50),
+        # Figure 2: Top taxa by prevalence (prevalence is not affected by mean/median)
+        plot_prev = (
+            comp_view.sort_values(["prevalence", "abundance"], ascending=[False, False])
+            .head(top_n_plot)
+            .copy()
+        )
+
+        fig_prev = px.bar(
+            plot_prev.iloc[::-1],
             x="taxon",
             y="prevalence",
-            title=f"{dis}: prevalence, showing up to 50 taxa",
+            hover_data=["abundance", "n_samples"],
+            title=f"Top {len(plot_prev)} taxa by prevalence ({agg2}) in {dis}",
         )
-        figp.update_layout(xaxis_title="Taxon", yaxis_title="Prevalence", xaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(figp, use_container_width=True)
+        fig_prev.update_layout(
+            xaxis_title="Taxon",
+            yaxis_title=f"Prevalence({agg2})",
+            xaxis={"categoryorder": "total ascending"},
+        )
+        st.plotly_chart(fig_prev, use_container_width=True)
 
     
 def page_taxon_across_diseases(samples: pd.DataFrame, abund: pd.DataFrame, taxa: pd.DataFrame) -> None:
